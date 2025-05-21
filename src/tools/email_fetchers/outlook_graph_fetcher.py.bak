@@ -1,0 +1,335 @@
+import logging
+import requests
+from typing import List, Dict, Optional, Any
+from datetime import datetime, timezone
+import base64
+
+# pip install msal requests
+from msal import ConfidentialClientApplication, PublicClientApplication
+
+from .base_fetcher import AbstractEmailFetcher, EmailMessage, Attachment
+from src.utils.logger import getLogger
+
+logger = getLogger(__name__)
+
+class OutlookGraphFetcher(AbstractEmailFetcher):
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__(config)
+
+GRAPH_API_ENDPOINT = 'https://graph.microsoft.com/v1.0'
+
+class OutlookGraphAPIFetcher(AbstractEmailFetcher):
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__(config)
+        # 共享配置
+        self.client_id = config.get("client_id")
+        self.user_principal_name = config.get("user_principal_name", self.account_email)
+        
+        # 租户模式配置 (应用权限)
+        self.tenant_id = config.get("tenant_id")
+        self.client_secret = config.get("client_secret")
+        
+        # 个人账户配置 (委派权限)
+        self.username = config.get("username", self.account_email)
+        self.password = config.get("password")
+        self.provided_token = config.get("access_token")
+        
+        # 初始化其他属性
+        self.app = None
+        self.access_token = None
+        
+        # 根据参数判断认证模式
+        if self.client_secret and self.tenant_id:
+            self.auth_mode = "tenant"
+            self.authority = f"https://login.microsoftonline.com/{self.tenant_id}"
+            self.scopes = config.get("scopes", ["https://graph.microsoft.com/.default"])
+        else:
+            self.auth_mode = "personal"
+            self.authority = "https://login.microsoftonline.com/consumers"
+            self.scopes = config.get("scopes", ["Mail.Read", "Mail.ReadWrite"])
+        
+        logger.info(f"Initialized OutlookGraphAPIFetcher with auth mode: {self.auth_mode}")
+
+
+    def _get_tenant_token(self):
+        """使用客户端密钥获取应用级令牌(应用权限)"""
+        if not self.app:
+            self.app = ConfidentialClientApplication(
+                client_id=self.client_id,
+                authority=self.authority,
+                client_credential=self.client_secret
+            )
+        
+        result = self.app.acquire_token_silent(scopes=self.scopes, account=None)
+        if not result:
+            logger.info(f"Outlook Graph API: No suitable token in cache for tenant {self.tenant_id}, acquiring new one...")
+            result = self.app.acquire_token_for_client(scopes=self.scopes)
+        
+        if "access_token" in result:
+            self.access_token = result['access_token']
+            logger.info(f"Outlook Graph API: Successfully acquired app token for client_id {self.client_id}")
+            return self.access_token
+        else:
+            error_msg = f"Failed to acquire app token: {result.get('error_description')}"
+            logger.error(error_msg)
+            raise ConnectionError(error_msg)
+
+    def _get_personal_token(self):
+        """使用用户名密码获取用户级令牌(委派权限)"""
+        if not self.app:
+            self.app = PublicClientApplication(
+                client_id=self.client_id,
+                authority=self.authority
+            )
+        
+        # 尝试从缓存获取令牌
+        accounts = self.app.get_accounts(username=self.username)
+        if accounts:
+            logger.info(f"Found account in cache for {self.username}")
+            result = self.app.acquire_token_silent(scopes=self.scopes, account=accounts[0])
+            if result:
+                logger.info(f"Got token from cache for {self.username}")
+                self.access_token = result.get('access_token')
+                return self.access_token
+        
+        # 如果缓存中没有令牌，则使用用户名密码获取
+        if self.password:
+            try:
+                logger.info(f"No token in cache for {self.username}, trying username/password auth...")
+                result = self.app.acquire_token_by_username_password(
+                    username=self.username,
+                    password=self.password,
+                    scopes=self.scopes
+                )
+                
+                if "access_token" in result:
+                    self.access_token = result['access_token']
+                    logger.info(f"Successfully acquired token for {self.username}")
+                    return self.access_token
+                else:
+                    logger.warning(f"Username/password auth failed: {result.get('error')}: {result.get('error_description')}")
+                    # Continue to device code flow as fallback
+            except ValueError as e:
+                if "wstrust endpoint" in str(e):
+                    logger.warning("Microsoft personal accounts don't support username/password authentication. "
+                                "Falling back to device code flow.")
+                else:
+                    logger.warning(f"Username/password auth error: {str(e)}")
+                # Continue to device code flow as fallback
+        
+        # If we reach here, try device code flow as last resort
+        logger.info("Starting device code flow authentication...")
+        flow = self.app.initiate_device_flow(scopes=self.scopes)
+        if "user_code" not in flow:
+            error_msg = f"Failed to start device code flow: {flow.get('error_description')}"
+            logger.error(error_msg)
+            raise ConnectionError(error_msg)
+        
+        # Print the message for the user to follow
+        print(flow["message"])
+        logger.info(f"Device code flow message: {flow['message']}")
+        
+        # Wait for the user to complete the flow
+        result = self.app.acquire_token_by_device_flow(flow)
+        
+        if "access_token" in result:
+            self.access_token = result['access_token']
+            logger.info(f"Successfully acquired token via device code flow for {self.username}")
+            return self.access_token
+        else:
+            error_msg = f"Failed to acquire token via device code flow: {result.get('error_description')}"
+            logger.error(error_msg)
+            raise ConnectionError(error_msg)
+ 
+
+    def connect(self) -> None:
+        try:
+            # 首先检查是否已提供访问令牌
+            if self.provided_token:
+                self.access_token = self.provided_token
+                logger.info(f"Using provided access token")
+                return
+                
+            # 否则根据认证模式获取令牌
+            if self.auth_mode == "tenant":
+                self._get_tenant_token()
+            else:  # personal mode
+                self._get_personal_token()
+                
+        except Exception as e:
+            logger.error(f"Outlook Graph API: Connection failed: {e}")
+            raise
+
+    def _make_graph_api_call(self, method, url_suffix, params=None, json_data=None, headers=None):
+        if not self.access_token:
+            self.connect()
+
+        req_headers = {
+            'Authorization': 'Bearer ' + self.access_token,
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+        }
+        if headers:
+            req_headers.update(headers)
+
+        full_url = f"{GRAPH_API_ENDPOINT}{url_suffix}"
+        try:
+            response = requests.request(method, full_url, headers=req_headers, params=params, json=json_data)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"Outlook Graph API: HTTP error for {method} {full_url}: {e.response.status_code} - {e.response.text}")
+            if e.response.status_code == 401:  # 未授权，令牌可能已过期
+                if not self.provided_token:  # 如果不是使用提供的固定令牌
+                    logger.info("Outlook Graph API: Token might be expired, attempting to re-acquire.")
+                    self.access_token = None  # 强制下次调用重新获取
+                else:
+                    logger.error("Outlook Graph API: Provided token is invalid or expired.")
+            raise
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Outlook Graph API: Request exception for {method} {full_url}: {e}")
+            raise
+
+    def fetch_emails(self, criteria: Optional[Dict[str, Any]] = None) -> List[EmailMessage]:
+        if not self.access_token:
+            self.connect()
+
+        fetched_emails: List[EmailMessage] = []
+        
+        # Graph API filtering is powerful: https://docs.microsoft.com/en-us/graph/query-parameters
+        # Example: fetch only unread emails
+        # Graph API 过滤器
+        filter_query = "isRead eq false" 
+        if criteria and "graph_filter_string" in criteria:
+            filter_query = criteria["graph_filter_string"]
+        elif criteria and "since_date" in criteria: # datetime object
+            # Ensure datetime is in ISO 8601 format and UTC
+            dt_utc = criteria["since_date"].astimezone(timezone.utc)
+            date_str = dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+            filter_query = f"isRead eq false and receivedDateTime ge {date_str}"
+
+        # Endpoint: /me/messages for current user (delegated), or /users/{id|userPrincipalName}/messages for specific user (app or delegated)
+        # To get attachments inline (up to a certain size), use $expand=attachments
+        # To get body content, it's usually included by default or ensure 'body' is in $select
+        # $select=id,subject,from,toRecipients,ccRecipients,receivedDateTime,body,hasAttachments,messageId
+        # $expand=attachments($select=name,contentType,size,contentBytes) # if size permits for contentBytes
+        
+        select_fields = "id,messageId,subject,from,toRecipients,ccRecipients,receivedDateTime,body,hasAttachments"
+        expand_fields = "attachments($select=name,contentType,contentBytes)" # Note: contentBytes for small attachments only
+        
+        # 根据认证模式选择合适的API端点
+        if self.auth_mode == "tenant":
+            # 应用权限模式 - 需要指定用户
+            url_suffix = f"/users/{self.user_principal_name}/messages"
+        else:
+            # 委派权限模式 - 使用当前用户上下文
+            url_suffix = "/me/messages"
+            
+        params = {
+            "$filter": filter_query,
+            "$select": select_fields,
+            "$expand": expand_fields, # Be cautious with expanding attachments directly if many/large
+            "$top": str(criteria.get("limit", 25)) if criteria else "25" # Limit results
+        }
+        
+        logger.debug(f"Outlook Graph API: Fetching emails with params: {params}")
+        
+        try:
+            response_data = self._make_graph_api_call("GET", url_suffix, params=params)
+            graph_messages = response_data.get('value', [])
+
+            if not graph_messages:
+                logger.info(f"Outlook Graph API: No emails found for filter '{filter_query}'")
+                return []
+
+            logger.info(f"Outlook Graph API: Found {len(graph_messages)} emails matching filter.")
+
+            for msg_data in graph_messages:
+                email_id = msg_data.get('id')
+                message_id_header = msg_data.get('messageId') # This is the actual Message-ID header
+                subject = msg_data.get('subject')
+                sender_obj = msg_data.get('from', {}).get('emailAddress', {})
+                sender = f"{sender_obj.get('name', '')} <{sender_obj.get('address', '')}>".strip()
+                
+                to_recipients = [f"{r.get('emailAddress', {}).get('name', '')} <{r.get('emailAddress', {}).get('address', '')}>".strip() 
+                                 for r in msg_data.get('toRecipients', [])]
+                cc_recipients = [f"{r.get('emailAddress', {}).get('name', '')} <{r.get('emailAddress', {}).get('address', '')}>".strip() 
+                                 for r in msg_data.get('ccRecipients', [])]
+
+                body_obj = msg_data.get('body', {})
+                body_content = body_obj.get('content', '')
+                body_type = body_obj.get('contentType', 'text').lower() # 'text' or 'html'
+                body_text = body_content if body_type == 'text' else None
+                body_html = body_content if body_type == 'html' else None
+
+                received_dt_str = msg_data.get('receivedDateTime')
+                received_dt = datetime.fromisoformat(received_dt_str.replace('Z', '+00:00')) if received_dt_str else None
+                
+                attachments_list = []
+                if msg_data.get('hasAttachments'):
+                    # If attachments were expanded and small enough:
+                    for att_data in msg_data.get('attachments', []):
+                        if 'contentBytes' in att_data: # Only if contentBytes were returned
+                            attachments_list.append(
+                                Attachment(
+                                    filename=att_data.get('name'),
+                                    content_type=att_data.get('contentType'),
+                                    data=base64.b64decode(att_data['contentBytes'])
+                                )
+                            )
+                        # Else, if 'contentBytes' is not there, you'd need another API call for each attachment:
+                        # GET /users/{id|userPrincipalName}/messages/{message_id}/attachments/{attachment_id}
+                        # This example assumes attachments are small enough for direct expansion.
+
+                fetched_emails.append(
+                    EmailMessage(
+                        id=email_id,
+                        message_id_header=message_id_header,
+                        subject=subject,
+                        sender=sender,
+                        recipients_to=to_recipients,
+                        recipients_cc=cc_recipients,
+                        body_text=body_text,
+                        body_html=body_html,
+                        received_date=received_dt,
+                        attachments=attachments_list,
+                        raw=msg_data,
+                        provider_type="outlook_graph",
+                        account_email=self.account_email
+                    )
+                )
+            return fetched_emails
+
+        except Exception as e:
+            logger.error(f"Outlook Graph API: Error during email fetching for {self.user_principal_name}: {e}")
+            raise
+
+    def mark_as_read(self, email_ids: List[str]) -> None:
+        if not self.access_token:
+            self.connect()
+        if not email_ids:
+            return
+
+        # Graph API can batch requests, but for simplicity, update one by one
+        # or implement batching: https://docs.microsoft.com/en-us/graph/json-batching
+        for email_id in email_ids:
+            url_suffix = f"/users/{self.user_principal_name}/messages/{email_id}"
+            # 根据认证模式选择合适的API端点
+            if self.auth_mode == "tenant":
+                url_suffix = f"/users/{self.user_principal_name}/messages/{email_id}"
+            else:
+                url_suffix = f"/me/messages/{email_id}"
+                
+            patch_data = {"isRead": True}
+            try:
+                logger.info(f"Outlook Graph API: Marking email {email_id} as read.")
+                self._make_graph_api_call("PATCH", url_suffix, json_data=patch_data)
+            except Exception as e:
+                logger.error(f"Outlook Graph API: Error marking email {email_id} as read: {e}")
+
+
+    def disconnect(self) -> None:
+        # For MSAL, clearing the token from memory is akin to 'disconnecting' the current session's auth state
+        self.access_token = None
+        # The app object (ConfidentialClientApplication) can persist for token caching.
+        logger.info(f"Outlook Graph API: 'Disconnected' (token cleared) for user {self.user_principal_name}")
